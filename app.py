@@ -37,6 +37,9 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 
+def is_admin(user):
+    return user.role in ["admin", "super_admin"]
+
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -66,11 +69,13 @@ class Ticket(db.Model):
     description = db.Column(db.String(500))
     priority = db.Column(db.String(50), default="LOW")
     status = db.Column(db.String(50), default="OPEN")
-#user
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
+    
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String, default="user")
 
 # ---------------- HELPERS ----------------
 def ticket_to_dict(ticket):
@@ -98,11 +103,54 @@ def validate_ticket(data):
 
     return None
 
+# get users
+@app.route("/api/users", methods=["GET"])
+@token_required
+def get_users():
+    current_user = User.query.get(request.user_id)
 
-tickets = []
+   
+    if not is_admin(current_user):
+        return jsonify({"error": "Access denied"}), 403
+
+    users = User.query.all()
+
+    result = []
+    for u in users:
+        result.append({
+            "id": u.id,
+            "username": u.username,
+            "role": u.role
+        })
+
+    return jsonify(result)
+
+#promote 
+@app.route("/api/users/<int:id>/make-admin", methods=["PATCH"])
+@token_required
+def make_admin(id):
+    current_user = User.query.get(request.user_id)
+    user = User.query.get(id)
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # ❌ only admin or super admin
+    if not is_admin(current_user):
+        return jsonify({"error": "Access denied"}), 403
+
+    # ❌ cannot modify super admin
+    if user.role == "super_admin":
+        return jsonify({"error": "Cannot modify super admin"}), 403
+
+    user.role = "admin"
+    db.session.commit()
+
+    return jsonify({"message": "User promoted"})
 
 # CREATE
 @app.route("/api/tickets", methods=["POST"])
+@token_required
 def create_ticket():
     data = request.json or {}
 
@@ -114,7 +162,8 @@ def create_ticket():
         title=data.get("title"),
         description=data.get("description"),
         priority=data.get("priority", "LOW"),
-        status=data.get("status", "OPEN")
+        status=data.get("status", "OPEN"),
+        user_id=request.user_id
     )
 
     db.session.add(ticket)
@@ -126,12 +175,19 @@ def create_ticket():
 @app.route("/api/tickets", methods=["GET"])
 @token_required
 def get_tickets():
-    tickets = Ticket.query.all()
+    user = User.query.get(request.user_id)
+
+    if user.role == "admin":
+        tickets = Tickets.query.all()
+    else:
+        tickets = Ticket.query.filter_by(user_id=request.user_id).all()
+
     return jsonify([ticket_to_dict(t) for t in tickets])
 
 
 # UPDATE (status / fields)
 @app.route("/api/tickets/<int:id>", methods=["PATCH"])
+@token_required
 def update_ticket(id):
     data = request.json or {}
 
@@ -162,17 +218,39 @@ def update_ticket(id):
     return jsonify(ticket_to_dict(ticket))
 
 # DELETE
-@app.route("/api/tickets/<int:id>", methods=["DELETE"])
-def delete_ticket(id):
-    ticket = Ticket.query.get(id)
+@app.route("/api/users/<int:id>", methods=["DELETE"])
+@token_required
+def delete_user(id):
+    current_user = User.query.get(request.user_id)
+    user = User.query.get(id)
 
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
+    if not user:
+        return jsonify({"error": "User not found"}), 404
 
-    db.session.delete(ticket)
+    # ❌ only admin or super admin
+    if not is_admin(current_user):
+        return jsonify({"error": "Access denied"}), 403
+
+    # ❌ cannot delete super admin
+    if user.role == "super_admin":
+        return jsonify({"error": "Cannot delete super admin"}), 403
+
+    # ❌ prevent self delete
+    if user.id == current_user.id:
+        return jsonify({"error": "Cannot delete yourself"}), 400
+
+    # ❌ prevent last admin removal
+    admin_count = User.query.filter(
+        User.role.in_(["admin", "super_admin"])
+    ).count()
+
+    if user.role in ["admin", "super_admin"] and admin_count <= 1:
+        return jsonify({"error": "At least one admin required"}), 400
+
+    db.session.delete(user)
     db.session.commit()
 
-    return jsonify({"message": "Ticket deleted successfully"})
+    return jsonify({"message": "User deleted"})
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
@@ -211,7 +289,37 @@ def login():
         "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
     }, app.config['SECRET_KEY'], algorithm="HS256")
 
-    return jsonify({"token": token})
+    return jsonify({"token": token, "role": user.role})
+
+@app.route("/api/users/<int:id>/demote", methods=["PATCH"])
+@token_required
+def demote_user(id):
+    current_user = User.query.get(request.user_id)
+    user = User.query.get(id)
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # ❌ only admin or super admin
+    if not is_admin(current_user):
+        return jsonify({"error": "Access denied"}), 403
+
+    # ❌ cannot modify super admin
+    if user.role == "super_admin":
+        return jsonify({"error": "Cannot modify super admin"}), 403
+
+    # ❌ prevent last admin removal
+    admin_count = User.query.filter(
+        User.role.in_(["admin", "super_admin"])
+    ).count()
+
+    if admin_count <= 1:
+        return jsonify({"error": "At least one admin required"}), 400
+
+    user.role = "user"
+    db.session.commit()
+
+    return jsonify({"message": "User demoted"})
 
 if __name__ == "__main__":
    app.run(host="0.0.0.0", port=port)
