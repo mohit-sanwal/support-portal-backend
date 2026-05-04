@@ -6,10 +6,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import datetime
 from functools import wraps
+from dotenv import load_dotenv
 import os
 from flask_migrate import Migrate
 
-
+load_dotenv()
 port = int(os.environ.get("PORT", 5000))
 
 app = Flask(__name__)
@@ -19,7 +20,18 @@ app.config['SECRET_KEY'] = '#$%@#$%^90808792##'
 
 # db config
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://user:pass@host:5432/dbname'
+uri = os.getenv("DATABASE_URL")
+if not uri:
+    raise Exception("DB URL missing")
+
+if uri.startswith("postgres://"):
+    uri = uri.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = uri
+
+print(os.getenv("DATABASE_URL"))
+print(os.getenv("DATABASE_PUBLIC_URL"))
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -171,7 +183,7 @@ def register():
 
     existing = User.query.filter_by(username=data["username"]).first()
     if existing:
-        return jsonify({"error": "User already exists"}), 400
+        return jsonify({"error": "User already exists"}), 409
 
     hashed_password = generate_password_hash(data["password"])
 
