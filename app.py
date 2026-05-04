@@ -7,6 +7,7 @@ import jwt
 import datetime
 from functools import wraps
 import os
+from flask_migrate import Migrate
 
 
 port = int(os.environ.get("PORT", 5000))
@@ -18,10 +19,11 @@ app.config['SECRET_KEY'] = '#$%@#$%^90808792##'
 
 # db config
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tickets.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://user:pass@host:5432/dbname'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
 def token_required(f):
     @wraps(f)
