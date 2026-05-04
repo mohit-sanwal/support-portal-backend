@@ -6,6 +6,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import datetime
 from functools import wraps
+import os
+
+
+port = int(os.environ.get("PORT", 5000))
 
 app = Flask(__name__)
 CORS(app)
@@ -196,4 +200,4 @@ def login():
     return jsonify({"token": token})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+   app.run(host="0.0.0.0", port=port)
