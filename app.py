@@ -9,6 +9,7 @@ from functools import wraps
 from dotenv import load_dotenv
 import os
 from flask_migrate import Migrate
+from sqlalchemy import or_
 
 load_dotenv()
 port = int(os.environ.get("PORT", 5000))
@@ -64,6 +65,48 @@ def token_required(f):
 
     return decorated
 
+def can_comment(user, ticket):
+
+    assignment = TicketAssignment.query.filter_by(
+        ticket_id=ticket.id
+    ).order_by(TicketAssignment.id.desc()).first()
+
+    # assigned user
+    if assignment and assignment.assigned_to == user.id:
+        return True
+
+    # admin/super admin
+    if user.role in ["admin", "super_admin"]:
+        return True
+
+    return False
+
+def build_comment_tree(comments):
+    comment_map = {}
+    root = []
+
+    for c in comments:
+        user = User.query.get(c.user_id)   # 👈 fetch user
+
+        node = {
+            "id": c.id,
+            "content": c.content,
+            "user_id": c.user_id,
+            "username": user.username if user else "Unknown",
+            "parent_id": c.parent_id,
+            "created_at": c.created_at.isoformat(),  # 👈 stringify
+            "replies": []
+        }
+        comment_map[c.id] = node
+
+    for c in comments:
+        if c.parent_id and c.parent_id in comment_map:
+            comment_map[c.parent_id]["replies"].append(comment_map[c.id])
+        else:
+            root.append(comment_map[c.id])
+
+    return root
+
 # ---------------- MODEL ----------------
 #ticket
 class Ticket(db.Model):
@@ -79,19 +122,72 @@ class User(db.Model):
     username = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
     role = db.Column(db.String, default="user")
+    can_assign = db.Column(db.Boolean, default=False)
+
+class Comment(db.Model):
+    __tablename__ = "comments"
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.String(500), nullable=False)
+    ticket_id = db.Column(db.Integer, db.ForeignKey("ticket.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    parent_id = db.Column(db.Integer, db.ForeignKey("comments.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class TicketAssignment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    ticket_id = db.Column(db.Integer, db.ForeignKey("ticket.id"), nullable=False)
+    assigned_to = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    assigned_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 # ---------------- HELPERS ----------------
 def ticket_to_dict(ticket):
+
+    creator = User.query.get(ticket.user_id)
+
+    latest_assignment = TicketAssignment.query.filter_by(
+        ticket_id=ticket.id
+    ).order_by(TicketAssignment.id.desc()).first()
+
+    assigned_user = None
+    assigned_by_user = None
+
+    if latest_assignment:
+        assigned_user = User.query.get(latest_assignment.assigned_to)
+        assigned_by_user = User.query.get(latest_assignment.assigned_by)
+
     return {
         "id": ticket.id,
         "title": ticket.title,
         "description": ticket.description,
         "priority": ticket.priority,
-        "status": ticket.status
+        "status": ticket.status,
+
+        # creator
+        "created_by": ticket.user_id,
+        "created_by_name": creator.username if creator else "Unknown",
+
+        # assignment
+        "assigned_to": latest_assignment.assigned_to if latest_assignment else None,
+        "assigned_to_name": assigned_user.username if assigned_user else None,
+
+        "assigned_by": latest_assignment.assigned_by if latest_assignment else None,
+        "assigned_by_name": assigned_by_user.username if assigned_by_user else None
     }
 
+def can_user_assign(current_user):
+    if current_user.role in ["admin", "super_admin"]:
+        return True
+    return current_user.can_assign
+
 # ---------------- VALIDATION ----------------
-ALLOWED_STATUSES = ["OPEN", "IN_PROGRESS", "DONE"]
+ALLOWED_STATUSES = [
+    "OPEN",
+    "IN_PROGRESS",
+    "IN_REVIEW",
+    "IN_QA",
+    "DONE"
+]
 ALLOWED_PRIORITIES = ["LOW", "MEDIUM", "HIGH"]
 
 def validate_ticket(data):
@@ -149,11 +245,11 @@ def make_admin(id):
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # ❌ only admin or super admin
+    # only admin or super admin
     if not is_admin_or_superAdmin(current_user):
         return jsonify({"error": "Access denied"}), 403
 
-    # ❌ cannot modify super admin
+    # cannot modify super admin
     if user.role == "super_admin":
         return jsonify({"error": "Cannot modify super admin"}), 403
 
@@ -185,16 +281,52 @@ def create_ticket():
 
     return jsonify(ticket_to_dict(ticket)), 201
 
-# READ ALL
+# READ ALL TICKETS
 @app.route("/api/tickets", methods=["GET"])
 @token_required
 def get_tickets():
     current_user = User.query.get(request.user_id)
-
+    # admin/super admin → all tickets
     if is_admin_or_superAdmin(current_user):
         tickets = Ticket.query.all()
     else:
-        tickets = Ticket.query.filter_by(user_id=request.user_id).all()
+        # tickets assigned to current user
+        assigned_ticket_ids = db.session.query(
+            TicketAssignment.ticket_id
+        ).filter(
+            TicketAssignment.assigned_to == current_user.id
+        ).distinct()
+
+        tickets = Ticket.query.filter(
+            or_(
+                # own unassigned tickets
+                (
+                    (Ticket.user_id == current_user.id)
+                ),
+
+                # assigned tickets
+                Ticket.id.in_(assigned_ticket_ids)
+            )
+        ).all()
+
+        # remove tickets reassigned to others
+        filtered = []
+
+        for t in tickets:
+
+            latest_assignment = TicketAssignment.query.filter_by(
+                ticket_id=t.id
+            ).order_by(TicketAssignment.id.desc()).first()
+
+            # no assignment → creator can see
+            if not latest_assignment:
+                filtered.append(t)
+
+            # assigned to current user
+            elif latest_assignment.assigned_to == current_user.id:
+                filtered.append(t)
+
+        tickets = filtered
 
     return jsonify([ticket_to_dict(t) for t in tickets])
 
@@ -208,10 +340,14 @@ def delete_ticket(id):
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
-    # ✅ If not admin/super_admin → allow only own ticket
-    if current_user.role not in ["admin", "super_admin"]:
+    # 👤 USER rule
+    if current_user.role == "user":
         if ticket.user_id != current_user.id:
             return jsonify({"error": "Access denied"}), 403
+
+    # 🧑‍💼 ADMIN / SUPER ADMIN → allow all
+    elif current_user.role not in ["admin", "super_admin"]:
+        return jsonify({"error": "Access denied"}), 403
 
     db.session.delete(ticket)
     db.session.commit()
@@ -261,19 +397,19 @@ def delete_user(id):
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # ❌ only super admin allowed
+    # only super admin allowed
     if not is_super_admin(current_user):
         return jsonify({"error": "Only super admin allowed"}), 403
 
-    # ❌ cannot delete super admin
+    # cannot delete super admin
     if user.role == "super_admin":
         return jsonify({"error": "Cannot delete super admin"}), 403
 
-    # ❌ prevent self delete
+    # prevent self delete
     if user.id == current_user.id:
         return jsonify({"error": "Cannot delete yourself"}), 400
 
-    # ❌ prevent last admin removal
+    # prevent last admin removal
     admin_count = User.query.filter(
         User.role.in_(["admin", "super_admin"])
     ).count()
@@ -334,15 +470,15 @@ def demote_user(id):
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # ❌ only super admin allowed
+    # only super admin allowed
     if not is_super_admin(current_user):
         return jsonify({"error": "Only super admin allowed"}), 403
 
-    # ❌ cannot modify super admin
+    # cannot modify super admin
     if user.role == "super_admin":
         return jsonify({"error": "Cannot modify super admin"}), 403
 
-    # ❌ prevent last admin removal
+    # prevent last admin removal
     admin_count = User.query.filter(
         User.role.in_(["admin", "super_admin"])
     ).count()
@@ -354,6 +490,156 @@ def demote_user(id):
     db.session.commit()
 
     return jsonify({"message": "User demoted"})
+
+@app.route("/api/tickets/<int:id>/assign", methods=["POST"])
+@token_required
+def assign_ticket(id):
+    current_user = User.query.get(request.user_id)
+    data = request.json or {}
+
+    if current_user.role not in ["admin", "super_admin"]:
+        return jsonify({"error": "Access denied"}), 403
+
+    ticket = Ticket.query.get(id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    assignment = TicketAssignment(
+        ticket_id=id,
+        assigned_to=data["assigned_to"],
+        assigned_by=current_user.id
+    )
+
+    db.session.add(assignment)
+    db.session.commit()
+
+    return jsonify({"message": "Ticket assigned"})
+
+
+@app.route("/api/tickets/<int:id>/assignment", methods=["GET"])
+@token_required
+def get_assignment(id):
+    assignment = TicketAssignment.query.filter_by(ticket_id=id).order_by(TicketAssignment.id.desc()).first()
+
+    if not assignment:
+        return jsonify({"assigned_to": None})
+
+    user = User.query.get(assignment.assigned_to)
+
+    return jsonify({
+        "assigned_to": assignment.assigned_to,
+        "assigned_to_name": user.username if user else "Unknown"
+    })
+
+@app.route("/api/users/assignable", methods=["GET"])
+@token_required
+def get_assignable_users():
+    current_user = User.query.get(request.user_id)
+
+    # no permission → empty list
+    if not can_user_assign(current_user):
+        return jsonify([])
+
+    if current_user.role == "super_admin":
+        users = User.query.all()
+
+    elif current_user.role == "admin":
+        users = User.query.filter(User.role != "super_admin").all()
+
+    else:
+        # user → only self
+        users = [current_user]
+
+    return jsonify([
+        {
+            "id": u.id,
+            "username": u.username,
+            "role": u.role
+        } for u in users
+    ])
+
+@app.route("/api/tickets/<int:ticket_id>/comments", methods=["POST"])
+@token_required
+def add_comment(ticket_id):
+    data = request.json or {}
+    user = User.query.get(request.user_id)
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    if not can_comment(user, ticket):
+        return jsonify({"error": "Access denied"}), 403
+
+    comment = Comment(
+        content=data.get("content"),
+        ticket_id=ticket_id,
+        user_id=user.id,
+        parent_id=data.get("parent_id")  # for reply
+    )
+
+    db.session.add(comment)
+    db.session.commit()
+
+    return jsonify({"message": "Comment added"})
+
+@app.route("/api/tickets/<int:ticket_id>/comments", methods=["GET"])
+@token_required
+def get_comments(ticket_id):
+    comments = Comment.query.filter_by(ticket_id=ticket_id).order_by(Comment.created_at.asc()).all()
+
+    tree = build_comment_tree(comments)
+
+    return jsonify(tree)
+
+@app.route("/api/comments/<int:id>", methods=["DELETE"])
+@token_required
+def delete_comment(id):
+    user = User.query.get(request.user_id)
+    comment = Comment.query.get(id)
+
+    if not comment:
+        return jsonify({"error": "Comment not found"}), 404
+
+    # permission check
+    if user.role not in ["admin", "super_admin"] and comment.user_id != user.id:
+        return jsonify({"error": "Access denied"}), 403
+
+    # NEW RULE: check replies exist
+    has_replies = Comment.query.filter_by(parent_id=comment.id).first()
+
+    if has_replies:
+        comment.content = "[deleted]"
+        db.session.commit()
+        return jsonify({"message": "Comment marked as deleted"})
+
+    db.session.delete(comment)
+    db.session.commit()
+
+    return jsonify({"message": "Comment deleted"})
+
+@app.route("/api/comments/<int:id>", methods=["PATCH"])
+@token_required
+def update_comment(id):
+    user = User.query.get(request.user_id)
+    comment = Comment.query.get(id)
+
+    if not comment:
+        return jsonify({"error": "Comment not found"}), 404
+
+    # permission
+    if user.role not in ["admin", "super_admin"] and comment.user_id != user.id:
+        return jsonify({"error": "Access denied"}), 403
+
+    data = request.json or {}
+
+    if not data.get("content"):
+        return jsonify({"error": "Content required"}), 400
+
+    comment.content = data["content"]
+    db.session.commit()
+
+    return jsonify({"message": "Comment updated"})
 
 if __name__ == "__main__":
    app.run(host="0.0.0.0", port=port)
