@@ -79,6 +79,10 @@ def can_comment(user, ticket):
     if user.role in ["admin", "super_admin"]:
         return True
 
+    # ticket creator
+    if ticket.user_id == user.id:
+        return True
+
     return False
 
 def build_comment_tree(comments):
@@ -107,6 +111,40 @@ def build_comment_tree(comments):
 
     return root
 
+
+def can_manage_comment(current_user, comment):
+
+    # super admin can manage all
+    if current_user.role == "super_admin":
+        return True
+
+    # everyone else only own comment
+    return comment.user_id == current_user.id
+
+def can_delete_ticket(current_user, ticket):
+
+    # own ticket
+    if ticket.user_id == current_user.id:
+        return True
+
+    ticket_owner = User.query.get(ticket.user_id)
+
+    if not ticket_owner:
+        return False
+
+    # super admin → all access
+    if current_user.role == "super_admin":
+        return True
+
+    # admin → only normal users tickets
+    if (
+        current_user.role == "admin" and
+        ticket_owner.role == "user"
+    ):
+        return True
+
+    return False
+
 # ---------------- MODEL ----------------
 #ticket
 class Ticket(db.Model):
@@ -116,6 +154,20 @@ class Ticket(db.Model):
     priority = db.Column(db.String(50), default="LOW")
     status = db.Column(db.String(50), default="OPEN")
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    comments = db.relationship(
+        "Comment",
+        backref="ticket",
+        cascade="all, delete-orphan",
+        passive_deletes=True
+    )
+
+    assignments = db.relationship(
+        "TicketAssignment",
+        backref="ticket",
+        cascade="all, delete-orphan",
+        passive_deletes=True
+    )
     
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -128,14 +180,22 @@ class Comment(db.Model):
     __tablename__ = "comments"
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.String(500), nullable=False)
-    ticket_id = db.Column(db.Integer, db.ForeignKey("ticket.id"), nullable=False)
+    ticket_id = db.Column(
+        db.Integer,
+        db.ForeignKey("ticket.id", ondelete="CASCADE"),
+        nullable=False
+    )
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     parent_id = db.Column(db.Integer, db.ForeignKey("comments.id"), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 class TicketAssignment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    ticket_id = db.Column(db.Integer, db.ForeignKey("ticket.id"), nullable=False)
+    ticket_id = db.Column(
+        db.Integer,
+        db.ForeignKey("ticket.id", ondelete="CASCADE"),
+        nullable=False
+    )
     assigned_to = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     assigned_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
@@ -166,13 +226,37 @@ def ticket_to_dict(ticket):
         # creator
         "created_by": ticket.user_id,
         "created_by_name": creator.username if creator else "Unknown",
+        "created_by_role": creator.role if creator else None,
+        "created_at": (
+            ticket.created_at.isoformat()
+            if ticket.created_at
+            else None
+        ),
 
         # assignment
-        "assigned_to": latest_assignment.assigned_to if latest_assignment else None,
-        "assigned_to_name": assigned_user.username if assigned_user else None,
+        "assigned_to": (
+            latest_assignment.assigned_to
+            if latest_assignment
+            else None
+        ),
 
-        "assigned_by": latest_assignment.assigned_by if latest_assignment else None,
-        "assigned_by_name": assigned_by_user.username if assigned_by_user else None
+        "assigned_to_name": (
+            assigned_user.username
+            if assigned_user
+            else None
+        ),
+
+        "assigned_by": (
+            latest_assignment.assigned_by
+            if latest_assignment
+            else None
+        ),
+
+        "assigned_by_name": (
+            assigned_by_user.username
+            if assigned_by_user
+            else None
+        )
     }
 
 def can_user_assign(current_user):
@@ -185,7 +269,7 @@ ALLOWED_STATUSES = [
     "OPEN",
     "IN_PROGRESS",
     "IN_REVIEW",
-    "IN_QA",
+    "IN_QE",
     "DONE"
 ]
 ALLOWED_PRIORITIES = ["LOW", "MEDIUM", "HIGH"]
@@ -219,13 +303,15 @@ def current_user():
 def get_users():
     current_user = User.query.get(request.user_id)
 
-   
     if not is_admin_or_superAdmin(current_user):
         return jsonify({"error": "Access denied"}), 403
 
-    users = User.query.all()
+    users = User.query.order_by(
+        User.id.desc()
+    ).all()
 
     result = []
+
     for u in users:
         result.append({
             "id": u.id,
@@ -288,7 +374,7 @@ def get_tickets():
     current_user = User.query.get(request.user_id)
     # admin/super admin → all tickets
     if is_admin_or_superAdmin(current_user):
-        tickets = Ticket.query.all()
+        tickets = Ticket.query.order_by(Ticket.created_at.desc(), Ticket.id.desc()).all()
     else:
         # tickets assigned to current user
         assigned_ticket_ids = db.session.query(
@@ -307,6 +393,8 @@ def get_tickets():
                 # assigned tickets
                 Ticket.id.in_(assigned_ticket_ids)
             )
+        ).order_by(
+            Ticket.created_at.desc(), Ticket.id.desc()
         ).all()
 
         # remove tickets reassigned to others
@@ -340,13 +428,7 @@ def delete_ticket(id):
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
-    # 👤 USER rule
-    if current_user.role == "user":
-        if ticket.user_id != current_user.id:
-            return jsonify({"error": "Access denied"}), 403
-
-    # 🧑‍💼 ADMIN / SUPER ADMIN → allow all
-    elif current_user.role not in ["admin", "super_admin"]:
+    if not can_delete_ticket(current_user, ticket):
         return jsonify({"error": "Access denied"}), 403
 
     db.session.delete(ticket)
@@ -461,9 +543,9 @@ def login():
 
     return jsonify({"token": token, "role": user.role})
 
-@app.route("/api/users/<int:id>/demote", methods=["PATCH"])
+@app.route("/api/users/<int:id>/make-user", methods=["PATCH"])
 @token_required
-def demote_user(id):
+def make_user(id):
     current_user = User.query.get(request.user_id)
     user = User.query.get(id)
 
@@ -489,24 +571,37 @@ def demote_user(id):
     user.role = "user"
     db.session.commit()
 
-    return jsonify({"message": "User demoted"})
+    return jsonify({"message": "Role converted to user"})
 
 @app.route("/api/tickets/<int:id>/assign", methods=["POST"])
 @token_required
 def assign_ticket(id):
+
     current_user = User.query.get(request.user_id)
+
     data = request.json or {}
 
     if current_user.role not in ["admin", "super_admin"]:
         return jsonify({"error": "Access denied"}), 403
 
     ticket = Ticket.query.get(id)
+
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
+    assigned_to = data.get("assigned_to")
+
+    if not assigned_to:
+        return jsonify({"error": "assigned_to is required"}), 400
+
+    user = User.query.get(assigned_to)
+
+    if not user:
+        return jsonify({"error": "Assigned user not found"}), 404
+
     assignment = TicketAssignment(
         ticket_id=id,
-        assigned_to=data["assigned_to"],
+        assigned_to=assigned_to,
         assigned_by=current_user.id
     )
 
@@ -628,9 +723,8 @@ def update_comment(id):
         return jsonify({"error": "Comment not found"}), 404
 
     # permission
-    if user.role not in ["admin", "super_admin"] and comment.user_id != user.id:
+    if not can_manage_comment(user, comment):
         return jsonify({"error": "Access denied"}), 403
-
     data = request.json or {}
 
     if not data.get("content"):
